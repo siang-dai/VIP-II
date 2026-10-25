@@ -1,0 +1,8 @@
+numpy>=2.0,<3
+pandas>=2.2,<3
+scipy>=1.14,<2
+arch>=7.2,<9
+yfinance>=0.2.65,<2
+requests>=2.32,<3
+exchange-calendars>=4.10,<5
+pytest>=8,<10
