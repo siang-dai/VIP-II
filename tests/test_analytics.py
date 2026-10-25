@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+from types import SimpleNamespace
 
+import vip2.analytics as analytics
 from vip2.analytics import (asset_metrics, correlations, ewma_volatility, fourier_moment,
                             fourier_weights, historical_volatility, paired_prices, validate_prices)
 
@@ -49,6 +51,46 @@ def test_all_four_volatility_series_are_causal_and_scale_invariant():
     scaled = asset_metrics(p * 10)
     np.testing.assert_allclose(full[["hv", "ewma", "instantaneous"]], scaled[["hv", "ewma", "instantaneous"]], rtol=1e-9, equal_nan=True)
     assert (full.iloc[505:, 1:] >= 0).all().all()
+
+
+def test_garch_restarts_failed_optimizer_and_accepts_only_converged_fit(monkeypatch):
+    training = pd.Series(np.random.default_rng(7).normal(size=504))
+    real_model = analytics.arch_model(training, mean="Zero", vol="GARCH", p=1, q=1,
+                                      dist="normal", rescale=False)
+    invalid = SimpleNamespace(convergence_flag=8, loglikelihood=-100.,
+                              params=pd.Series([.05, .1, .85], index=["omega", "alpha[1]", "beta[1]"]),
+                              conditional_volatility=np.ones(504),
+                              optimization_result=SimpleNamespace(message="Positive directional derivative"))
+    starts = []
+
+    def fit(**kwargs):
+        starts.append(kwargs["starting_values"])
+        return invalid if len(starts) == 1 else real_model.fit(**kwargs)
+
+    monkeypatch.setattr(analytics, "arch_model", lambda *a, **kw: SimpleNamespace(fit=fit))
+    result = analytics.fit_garch(training)
+    assert len(starts) == 2
+    assert starts[0] is None
+    assert np.all(starts[1] >= 0) and starts[1][1:].sum() < 1
+    assert result.convergence_flag == 0 and np.isfinite(result.loglikelihood)
+
+
+@pytest.mark.parametrize("status,params", [(8, [.05, .1, .85]), (0, [.05, .3, .9])])
+def test_garch_exhausted_or_invalid_fits_abort(monkeypatch, status, params):
+    calls = []
+    invalid = SimpleNamespace(convergence_flag=status, loglikelihood=-100.,
+                              params=pd.Series(params, index=["omega", "alpha[1]", "beta[1]"]),
+                              conditional_volatility=np.ones(504),
+                              optimization_result=SimpleNamespace(message="test"))
+
+    def fit(**kwargs):
+        calls.append(kwargs)
+        return invalid
+
+    monkeypatch.setattr(analytics, "arch_model", lambda *a, **kw: SimpleNamespace(fit=fit))
+    with pytest.raises(RuntimeError, match="failed validation after 4 starts"):
+        analytics.fit_garch(pd.Series(np.random.default_rng(7).normal(size=504)))
+    assert len(calls) == 4
 
 
 def test_correlations_identity_inverse_symmetry_and_bounds():

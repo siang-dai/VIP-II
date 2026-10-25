@@ -6,6 +6,7 @@ onto the endpoint. The resulting common nonnegative weights preserve PSD.
 This is a documented daily-data adaptation, not a numerical copy of VIP I.
 All values at t use data at or before t, including the GARCH refit schedule.
 """
+import logging
 import warnings
 from functools import lru_cache
 
@@ -48,6 +49,39 @@ def ewma_volatility(prices: pd.Series) -> pd.Series:
     return out
 
 
+def fit_garch(training: pd.Series):
+    """Fit unit-scaled returns, retrying SLSQP from valid deterministic starts.
+
+    A different starting point can resolve a boundary-related optimizer failure.
+    Every accepted result must still converge and satisfy the GARCH constraints;
+    retries never replace a failed fit with fixed parameters or another model.
+    """
+    model = arch_model(training, mean="Zero", vol="GARCH", p=1, q=1,
+                       dist="normal", rescale=False)
+    second_moment = float(np.mean(training ** 2))
+    starts = [None] + [np.array([second_moment * (1 - a - b), a, b])
+                       for a, b in ((.10, .85), (.10, .70), (.25, .50))]
+    failure = "invalid fit"
+    for attempt, start in enumerate(starts):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fitted = model.fit(starting_values=start, disp="off", show_warning=False,
+                               options={"maxiter": 3000})
+        params = fitted.params[["omega", "alpha[1]", "beta[1]"]].to_numpy()
+        conditional = np.asarray(fitted.conditional_volatility)
+        valid = (fitted.convergence_flag == 0 and np.isfinite(fitted.loglikelihood)
+                 and np.isfinite(params).all() and (params >= 0).all()
+                 and params[1:].sum() <= 1 + 1e-8
+                 and np.isfinite(conditional).all() and (conditional > 0).all())
+        if valid:
+            if attempt:
+                logging.getLogger(__name__).warning("GARCH converged after %d restart(s), window ending %s",
+                                                    attempt, training.index[-1])
+            return fitted
+        failure = f"status {fitted.convergence_flag}: {fitted.optimization_result.message}"
+    raise RuntimeError(f"GARCH fit failed validation after {len(starts)} starts ({failure})")
+
+
 def garch_volatility(prices: pd.Series) -> pd.Series:
     """Next-session forecast after each close; trailing 504d fit every 21 sessions.
 
@@ -68,13 +102,10 @@ def garch_volatility(prices: pd.Series) -> pd.Series:
                 # low-volatility bonds and high-volatility VIX. Convert back to
                 # percent-return units before applying the daily recursion.
                 scale = float(training.std(ddof=0))
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    fitted = arch_model(training / scale, mean="Zero", vol="GARCH", p=1, q=1,
-                                        dist="normal", rescale=False).fit(
-                        disp="off", show_warning=False, options={"maxiter": 1000})
-                if fitted.convergence_flag != 0:
-                    raise RuntimeError(f"GARCH did not converge at {r.index[i]}")
+                try:
+                    fitted = fit_garch(training / scale)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"GARCH did not converge at {r.index[i]}: {exc}") from exc
                 omega, alpha, beta = (float(fitted.params[k]) for k in
                                       ("omega", "alpha[1]", "beta[1]"))
                 omega *= scale ** 2
