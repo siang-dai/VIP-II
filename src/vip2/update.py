@@ -12,6 +12,7 @@ import pandas as pd
 from .analytics import asset_metrics, correlations
 from .config import ASSETS
 from .sources import completed_session, download_asset
+from .vix30 import SOURCES as VIX30_SOURCES, download_vix30
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,17 +34,7 @@ def validate_metrics(frame: pd.DataFrame, columns: list[str]) -> None:
             raise ValueError(f"Missing/nonfinite values in published {col}")
 
 
-def run(force: bool = False) -> bool:
-    now = pd.Timestamp.now(tz="UTC")
-    output = ROOT / "output"
-    manifest_path = output / "manifest.json"
-    expected = {a.id: completed_session(a.calendar, now) for a in ASSETS}
-    old = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    previous = {a["id"]: a for a in old.get("assets", [])}
-    if not force and all(previous.get(a.id, {}).get("as_of") == expected[a.id].strftime("%Y-%m-%d") for a in ASSETS):
-        print("All completed sessions are already published.")
-        return False
-
+def calculate_price_metrics(expected: dict) -> tuple[list, list, dict]:
     prices, assets, staged = {}, [], {}
     for asset in ASSETS:
         print(f"Fetching {asset.id}, completed session {expected[asset.id].date()}", flush=True)
@@ -68,7 +59,49 @@ def run(force: bool = False) -> bool:
         staged[file] = encode({"a": a.id, "b": b.id, **table(shown)})
         pairs.append({"a": a.id, "b": b.id, "file": file, "as_of": shown.index[-1].strftime("%Y-%m-%d"),
                       "cross_market": a.calendar != b.calendar})
+    return assets, pairs, staged
+
+
+def run(force: bool = False) -> bool:
+    now = pd.Timestamp.now(tz="UTC")
+    output = ROOT / "output"
+    manifest_path = output / "manifest.json"
+    expected = {a.id: completed_session(a.calendar, now) for a in ASSETS}
+    old = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    previous = {a["id"]: a for a in old.get("assets", [])}
+    prices_current = all(previous.get(a.id, {}).get("as_of") == expected[a.id].strftime("%Y-%m-%d") for a in ASSETS)
+    if not force and prices_current:
+        assets, pairs = old["assets"], old["pairs"]
+        staged = {item["file"]: (output / item["file"]).read_text(encoding="utf-8") for item in assets + pairs}
+    else:
+        assets, pairs, staged = calculate_price_metrics(expected)
+
+    # Observatory updates can arrive after prices: check them even when the
+    # price dates are unchanged, without refitting any of the existing models.
+    for asset in assets:
+        asset_id = asset["id"]
+        if asset_id not in VIX30_SOURCES:
+            continue
+        series = download_vix30(asset_id, expected[asset_id])
+        data = json.loads(staged[asset["file"]])
+        aligned = series.reindex(pd.to_datetime(data["dates"]))
+        valid = aligned.dropna()
+        if valid.empty:
+            raise ValueError(f"{asset_id}: no 30-day VIX on published price dates")
+        prior = previous.get(asset_id, {}).get("vix30", {})
+        first, last = valid.index[0].strftime("%Y-%m-%d"), valid.index[-1].strftime("%Y-%m-%d")
+        if prior and (last < prior["as_of"] or first > max(prior["history_start"], data["dates"][0])):
+            raise ValueError(f"{asset_id}: truncated 30-day VIX history")
+        data["vix30"] = table(aligned.to_frame())["vix30"]
+        staged[asset["file"]] = encode(data)
+        asset["vix30"] = {**VIX30_SOURCES[asset_id], "history_start": first, "as_of": last,
+                          "interpolation": "linear total variance", "horizon_days": 30}
+        print(f"{asset_id} 30-day VIX: {len(valid)} observations, latest {last}", flush=True)
+
     digest = hashlib.sha256("".join(staged.values()).encode()).hexdigest()[:16]
+    if not force and digest == old.get("release"):
+        print("All completed sessions and 30-day VIX observations are already published.")
+        return False
     manifest = {"schema": 1, "release": digest, "generated_at": now.isoformat(timespec="seconds"),
                 "frequency": "daily", "display_years": 5, "assets": assets, "pairs": pairs,
                 "methods": {"hv_window": 22, "ewma_lambda": 0.94, "garch_window": 504,
