@@ -37,12 +37,6 @@ The 1M / 3M / 6M / 1Y / 5Y controls only change the displayed dates. They do not
 - Cross-market pairs use local-date matching. Taiwan closes before the US: these are **asynchronous descriptive correlations**, not a same-information-time or predictive signal. Returns remain in each asset's native currency, with no FX conversion. Common-date returns may span more than one session around different holidays.
 - Different assets may have different latest dates. Exchange calendars plus a two-hour post-close buffer exclude incomplete sessions. Missing/truncated/stale data or failed fits abort publication and preserve the last good release.
 
-## Automation
-
-GitHub Actions checks at **00:37, 08:37 and 22:37 UTC, Monday–Saturday** (Taipei 08:37, 16:37, and next-day 06:37). This covers both markets and allows an EOD retry. If all latest completed sessions are already published, calculation is skipped. Schedules are best effort, not a real-time feed. A manual workflow input can force recalculation.
-
-The updater publishes one manifest, eight small asset JSON files and 28 pair JSON files. The page loads only the selected asset/pair and the Plotly basic bundle, with no raster chart downloads. Every run validates the full release before writing output. Source caches and the Python environment are ignored by Git.
-
 ## Run locally
 
 ```sh

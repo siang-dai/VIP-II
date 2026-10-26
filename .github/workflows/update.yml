@@ -11,8 +11,8 @@ on:
     branches: [main]
     paths: ["src/**", "tests/**", "requirements.txt", ".github/workflows/update.yml"]
   schedule:
-    # UTC; after Taiwan close, after US close, and a retry after EOD publication.
-    - cron: "37 0,8,22 * * 1-6"
+    # Hourly checks, matching the TXO and SPX workflows.
+    - cron: "17 * * * *"
 
 permissions:
   contents: write
