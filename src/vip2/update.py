@@ -1,5 +1,6 @@
 """Publish small per-asset / per-pair JSON files, preserving the last good release."""
 import argparse
+import copy
 import hashlib
 import itertools
 import json
@@ -62,7 +63,7 @@ def calculate_price_metrics(expected: dict) -> tuple[list, list, dict]:
     return assets, pairs, staged
 
 
-def run(force: bool = False) -> bool:
+def run(force: bool = False, vix_only: bool = False) -> bool:
     now = pd.Timestamp.now(tz="UTC")
     output = ROOT / "output"
     manifest_path = output / "manifest.json"
@@ -70,24 +71,26 @@ def run(force: bool = False) -> bool:
     old = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     previous = {a["id"]: a for a in old.get("assets", [])}
     prices_current = all(previous.get(a.id, {}).get("as_of") == expected[a.id].strftime("%Y-%m-%d") for a in ASSETS)
-    if not force and prices_current:
-        assets, pairs = old["assets"], old["pairs"]
+    if vix_only and not all(a.id in previous for a in ASSETS):
+        raise ValueError("A complete price publication is required for --vix-only")
+    if vix_only or (not force and prices_current):
+        assets, pairs = copy.deepcopy(old["assets"]), old["pairs"]
         staged = {item["file"]: (output / item["file"]).read_text(encoding="utf-8") for item in assets + pairs}
     else:
         assets, pairs, staged = calculate_price_metrics(expected)
 
-    # Observatory updates can arrive after prices: check them even when the
+    # Official index updates can arrive after prices: check them even when the
     # price dates are unchanged, without refitting any of the existing models.
     for asset in assets:
         asset_id = asset["id"]
         if asset_id not in VIX30_SOURCES:
             continue
-        series = download_vix30(asset_id, expected[asset_id])
+        series = download_vix30(asset_id, pd.Timestamp(asset["as_of"]))
         data = json.loads(staged[asset["file"]])
         aligned = series.reindex(pd.to_datetime(data["dates"]))
-        valid = aligned.dropna()
-        if valid.empty:
-            raise ValueError(f"{asset_id}: no 30-day VIX on published price dates")
+        if aligned.isna().any() or not np.isfinite(aligned).all() or (aligned <= 0).any():
+            raise ValueError(f"{asset_id}: official VIX must cover every published price date")
+        valid = aligned
         prior = previous.get(asset_id, {}).get("vix30", {})
         first, last = valid.index[0].strftime("%Y-%m-%d"), valid.index[-1].strftime("%Y-%m-%d")
         if prior and (last < prior["as_of"] or first > max(prior["history_start"], data["dates"][0])):
@@ -95,11 +98,11 @@ def run(force: bool = False) -> bool:
         data["vix30"] = table(aligned.to_frame())["vix30"]
         staged[asset["file"]] = encode(data)
         asset["vix30"] = {**VIX30_SOURCES[asset_id], "history_start": first, "as_of": last,
-                          "interpolation": "linear total variance", "horizon_days": 30}
+                          "official": True, "method": "official daily close", "horizon_days": 30}
         print(f"{asset_id} 30-day VIX: {len(valid)} observations, latest {last}", flush=True)
 
     digest = hashlib.sha256("".join(staged.values()).encode()).hexdigest()[:16]
-    if not force and digest == old.get("release"):
+    if not force and digest == old.get("release") and assets == old.get("assets"):
         print("All completed sessions and 30-day VIX observations are already published.")
         return False
     manifest = {"schema": 1, "release": digest, "generated_at": now.isoformat(timespec="seconds"),
@@ -124,4 +127,6 @@ def run(force: bool = False) -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Recalculate even if session dates are unchanged")
-    run(parser.parse_args().force)
+    parser.add_argument("--vix-only", action="store_true", help="Refresh official VIX on the existing price timeline")
+    args = parser.parse_args()
+    run(force=args.force, vix_only=args.vix_only)

@@ -119,6 +119,32 @@ def test_truncated_vix_history_is_not_published(current_price_release, monkeypat
     snapshot = {p: p.read_bytes() for p in output.rglob("*.json")}
     monkeypatch.setattr(update, "download_vix30", lambda *args: pd.Series(
         [22.], index=pd.to_datetime(["2026-10-22"]), name="vix30"))
-    with pytest.raises(ValueError, match="truncated"):
+    with pytest.raises(ValueError, match="cover every published price date"):
         update.run()
     assert {p: p.read_bytes() for p in snapshot} == snapshot
+
+
+def test_official_vix_gap_is_not_filled(current_price_release, monkeypatch):
+    output = current_price_release
+    snapshot = {p: p.read_bytes() for p in output.rglob("*.json")}
+    monkeypatch.setattr(update, "download_vix30", lambda *args: pd.Series(
+        [20., 22.], index=pd.to_datetime(["2026-10-20", "2026-10-22"]), name="vix30"))
+    with pytest.raises(ValueError, match="cover every published price date"):
+        update.run()
+    assert {p: p.read_bytes() for p in snapshot} == snapshot
+
+
+def test_vix_only_keeps_existing_price_dates(current_price_release, monkeypatch):
+    # Newer market sessions need not be available yet in every price source.
+    monkeypatch.setattr(update, "completed_session", lambda *args: pd.Timestamp("2026-10-27"))
+    download = update.download_vix30
+    requests = []
+    def record(asset_id, expected):
+        requests.append((asset_id, expected))
+        return download(asset_id, expected)
+    monkeypatch.setattr(update, "download_vix30", record)
+    assert update.run(vix_only=True)
+    assert requests == [("TAIEX", pd.Timestamp("2026-10-22")), ("SPX", pd.Timestamp("2026-10-22"))]
+    manifest = json.loads((current_price_release / "manifest.json").read_text())
+    assert all(a["as_of"] == "2026-10-22" for a in manifest["assets"])
+    assert all(a["vix30"]["official"] for a in manifest["assets"] if a["id"] in update.VIX30_SOURCES)
